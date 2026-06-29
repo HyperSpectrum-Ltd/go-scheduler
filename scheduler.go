@@ -30,6 +30,8 @@ type SchedulerManager struct {
 
 // TaskStatus 任务状态
 type TaskStatus struct {
+	mu sync.Mutex
+
 	Name         string
 	LastRunTime  *time.Time
 	LastDuration time.Duration
@@ -37,6 +39,21 @@ type TaskStatus struct {
 	FailedCount  int64
 	IsRunning    bool
 	LastErr      error
+}
+
+// snapshot 在持锁状态下返回 TaskStatus 的值拷贝，用于安全地对外暴露状态
+func (s *TaskStatus) snapshot() TaskStatus {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return TaskStatus{
+		Name:         s.Name,
+		LastRunTime:  s.LastRunTime,
+		LastDuration: s.LastDuration,
+		SuccessCount: s.SuccessCount,
+		FailedCount:  s.FailedCount,
+		IsRunning:    s.IsRunning,
+		LastErr:      s.LastErr,
+	}
 }
 
 // NewSchedulerManager 创建调度管理器
@@ -113,6 +130,7 @@ func (m *SchedulerManager) Start(ctx context.Context) error {
 		}
 
 		if task.Schedule().RunOnStart {
+			m.wg.Add(1)
 			go m.runTask(ctx, task)
 		}
 	}
@@ -131,6 +149,7 @@ func (m *SchedulerManager) scheduleTask(ctx context.Context, task Task) error {
 	schedule := task.Schedule()
 
 	jobFunc := func() {
+		m.wg.Add(1)
 		m.runTask(ctx, task)
 	}
 
@@ -148,16 +167,34 @@ func (m *SchedulerManager) scheduleTask(ctx context.Context, task Task) error {
 
 // runTask 运行任务
 func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
+	defer m.wg.Done()
+
+	// Bug 3: 检查调度器是否已停止
+	select {
+	case <-m.stopCh:
+		return
+	default:
+	}
+
 	status := m.taskStatus[task.Name()]
+
+	// Bug 1: 使用独立的状态锁保护 TaskStatus 字段的读写（不与 map 锁混用以避免死锁）
+	status.mu.Lock()
 	if status.IsRunning && task.RequireLock() {
+		status.mu.Unlock()
 		m.logger.Warn("task is already running, skipping",
 			zap.String("task", task.Name()),
 		)
 		return
 	}
-
 	status.IsRunning = true
-	defer func() { status.IsRunning = false }()
+	status.mu.Unlock()
+
+	defer func() {
+		status.mu.Lock()
+		status.IsRunning = false
+		status.mu.Unlock()
+	}()
 
 	startTime := time.Now()
 	m.metrics.RecordTaskStart(task.Name())
@@ -165,12 +202,19 @@ func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
 	err := m.executor.Execute(ctx, task)
 
 	duration := time.Since(startTime)
+
+	status.mu.Lock()
 	status.LastRunTime = &startTime
 	status.LastDuration = duration
-
 	if err != nil {
 		status.FailedCount++
 		status.LastErr = err
+	} else {
+		status.SuccessCount++
+	}
+	status.mu.Unlock()
+
+	if err != nil {
 		m.metrics.RecordTaskFailure(task.Name(), duration.Seconds())
 		m.logger.Error("task execution failed",
 			zap.String("task", task.Name()),
@@ -178,7 +222,6 @@ func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
 			zap.Error(err),
 		)
 	} else {
-		status.SuccessCount++
 		m.metrics.RecordTaskSuccess(task.Name(), duration.Seconds())
 		m.logger.Info("task execution completed",
 			zap.String("task", task.Name()),
@@ -190,22 +233,32 @@ func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
 // Stop 停止调度器
 func (m *SchedulerManager) Stop(ctx context.Context) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-
 	if !m.running {
+		m.mu.Unlock()
 		return nil
 	}
-
 	m.running = false
 	close(m.stopCh)
+	m.mu.Unlock()
 
 	cronCtx := m.cron.Stop()
 	<-cronCtx.Done()
 
-	m.wg.Wait()
+	// Bug 2/3: 等待所有 runTask goroutine 完成，同时尊重 ctx 超时
+	done := make(chan struct{})
+	go func() {
+		m.wg.Wait()
+		close(done)
+	}()
 
-	m.logger.Info("scheduler stopped")
-	return nil
+	select {
+	case <-done:
+		m.logger.Info("scheduler stopped")
+		return nil
+	case <-ctx.Done():
+		m.logger.Warn("scheduler stop timed out, some goroutines may still be running")
+		return ctx.Err()
+	}
 }
 
 // TriggerTask 手动触发任务
@@ -218,6 +271,7 @@ func (m *SchedulerManager) TriggerTask(ctx context.Context, taskName string) err
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskName)
 	}
 
+	m.wg.Add(1)
 	go m.runTask(ctx, task)
 	return nil
 }
@@ -225,13 +279,14 @@ func (m *SchedulerManager) TriggerTask(ctx context.Context, taskName string) err
 // GetTaskStatus 获取任务状态
 func (m *SchedulerManager) GetTaskStatus(taskName string) (*TaskStatus, error) {
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	status, exists := m.taskStatus[taskName]
+	m.mu.RUnlock()
+
 	if !exists {
 		return nil, fmt.Errorf("%w: %s", ErrTaskNotFound, taskName)
 	}
-	return status, nil
+	snap := status.snapshot()
+	return &snap, nil
 }
 
 // GetAllTaskStatus 获取所有任务状态
@@ -241,7 +296,8 @@ func (m *SchedulerManager) GetAllTaskStatus() map[string]*TaskStatus {
 
 	result := make(map[string]*TaskStatus, len(m.taskStatus))
 	for k, v := range m.taskStatus {
-		result[k] = v
+		snap := v.snapshot()
+		result[k] = &snap
 	}
 	return result
 }

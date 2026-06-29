@@ -4,27 +4,10 @@ import (
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // 默认 namespace
-var defaultNamespace = "go_scheduler"
-var namespaceMu sync.RWMutex
-
-// SetNamespace 设置 Prometheus 指标的 namespace
-// 必须在创建 PrometheusMetrics 之前调用
-func SetNamespace(ns string) {
-	namespaceMu.Lock()
-	defer namespaceMu.Unlock()
-	defaultNamespace = ns
-}
-
-// GetNamespace 返回当前设置的 namespace
-func GetNamespace() string {
-	namespaceMu.RLock()
-	defer namespaceMu.RUnlock()
-	return defaultNamespace
-}
+const defaultNamespace = "go_scheduler"
 
 // MetricsRecorder 指标记录器接口
 type MetricsRecorder interface {
@@ -38,25 +21,46 @@ type MetricsRecorder interface {
 
 // PrometheusMetrics 基于 Prometheus 的指标实现
 type PrometheusMetrics struct {
-	namespace          string
-	taskExecutionTotal *prometheus.CounterVec
+	mu sync.RWMutex
+
+	namespace             string
+	taskExecutionTotal    *prometheus.CounterVec
 	taskExecutionDuration *prometheus.HistogramVec
 	taskLastExecutionTime *prometheus.GaugeVec
-	taskQueueSize      *prometheus.GaugeVec
-	lockAcquisitionTotal *prometheus.CounterVec
-	activeTasksGauge   prometheus.Gauge
+	taskQueueSize         *prometheus.GaugeVec
+	lockAcquisitionTotal  *prometheus.CounterVec
+	activeTasksGauge      prometheus.Gauge
+}
+
+// registerOrGet 尝试注册 collector；若已有相同描述的 collector，则返回已注册的实例
+// 相比 promauto.MustRegister，在重复注册场景（测试 -count>1、生产多次初始化）下不会 panic
+func registerOrGet[T prometheus.Collector](r prometheus.Registerer, c T) T {
+	if err := r.Register(c); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			if existing, ok := are.ExistingCollector.(T); ok {
+				return existing
+			}
+		}
+		panic(err)
+	}
+	return c
 }
 
 // NewPrometheusMetrics 创建 Prometheus 指标记录器
-// 如果 namespace 为空，则使用默认值
-func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
+// registerer 用于注册指标，测试时可传入 prometheus.NewRegistry() 避免重复注册 panic
+// namespace 为指标命名空间，为空时使用默认值 "go_scheduler"
+// 重复注册同一指标时不会 panic，而是复用已注册的 collector
+func NewPrometheusMetrics(registerer prometheus.Registerer, namespace string) *PrometheusMetrics {
+	if registerer == nil {
+		registerer = prometheus.DefaultRegisterer
+	}
 	if namespace == "" {
-		namespace = GetNamespace()
+		namespace = defaultNamespace
 	}
 
 	return &PrometheusMetrics{
 		namespace: namespace,
-		taskExecutionTotal: promauto.NewCounterVec(
+		taskExecutionTotal: registerOrGet(registerer, prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
@@ -64,8 +68,8 @@ func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
 				Help:      "Total number of task executions",
 			},
 			[]string{"task", "status"},
-		),
-		taskExecutionDuration: promauto.NewHistogramVec(
+		)),
+		taskExecutionDuration: registerOrGet(registerer, prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
@@ -74,8 +78,8 @@ func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
 				Buckets:   prometheus.ExponentialBuckets(0.1, 2, 10),
 			},
 			[]string{"task"},
-		),
-		taskLastExecutionTime: promauto.NewGaugeVec(
+		)),
+		taskLastExecutionTime: registerOrGet(registerer, prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
@@ -83,8 +87,8 @@ func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
 				Help:      "Unix timestamp of last task execution",
 			},
 			[]string{"task"},
-		),
-		taskQueueSize: promauto.NewGaugeVec(
+		)),
+		taskQueueSize: registerOrGet(registerer, prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
@@ -92,8 +96,8 @@ func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
 				Help:      "Number of tasks in queue",
 			},
 			[]string{"status"},
-		),
-		lockAcquisitionTotal: promauto.NewCounterVec(
+		)),
+		lockAcquisitionTotal: registerOrGet(registerer, prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
@@ -101,16 +105,36 @@ func NewPrometheusMetrics(namespace string) *PrometheusMetrics {
 				Help:      "Total number of lock acquisitions",
 			},
 			[]string{"task", "result"},
-		),
-		activeTasksGauge: promauto.NewGauge(
+		)),
+		activeTasksGauge: registerOrGet(registerer, prometheus.NewGauge(
 			prometheus.GaugeOpts{
 				Namespace: namespace,
 				Subsystem: "scheduler",
 				Name:      "active_tasks",
 				Help:      "Number of currently active tasks",
 			},
-		),
+		)),
 	}
+}
+
+// NewPrometheusMetricsWithDefaults 使用默认 Registerer 创建 Prometheus 指标记录器
+// 保持向后兼容，适合生产环境使用
+func NewPrometheusMetricsWithDefaults(namespace string) *PrometheusMetrics {
+	return NewPrometheusMetrics(prometheus.DefaultRegisterer, namespace)
+}
+
+// SetNamespace 设置 Prometheus 指标的 namespace
+func (m *PrometheusMetrics) SetNamespace(ns string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.namespace = ns
+}
+
+// GetNamespace 返回当前设置的 namespace
+func (m *PrometheusMetrics) GetNamespace() string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.namespace
 }
 
 func (m *PrometheusMetrics) RecordTaskStart(taskName string) {

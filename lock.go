@@ -99,15 +99,15 @@ func (l *RedisLock) Release(ctx context.Context, key string, lockValue string) e
 func (l *RedisLock) Extend(ctx context.Context, key string, lockValue string, ttl time.Duration) error {
 	fullKey := l.prefix + key
 
-	// 使用 Lua 脚本验证锁值后再延长
+	// Bug 6: 使用 PEXPIRE（毫秒）替代 EXPIRE（秒），避免 ttl < 1s 时 int(ttl.Seconds()) 截断为 0 导致 key 被删除
 	script := `
 	if redis.call("get", KEYS[1]) == ARGV[1] then
-	    return redis.call("expire", KEYS[1], ARGV[2])
+	    return redis.call("pexpire", KEYS[1], ARGV[2])
 	else
 	    return 0
 	end
 	`
-	result, err := l.client.Eval(ctx, script, []string{fullKey}, lockValue, int(ttl.Seconds())).Int64()
+	result, err := l.client.Eval(ctx, script, []string{fullKey}, lockValue, int64(ttl.Milliseconds())).Int64()
 	if err != nil {
 		l.logger.Error("failed to extend lock",
 			zap.String("key", key),

@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -79,7 +81,15 @@ func (e *TaskExecutor) Execute(ctx context.Context, task Task) error {
 		// 创建带超时的上下文
 		execCtx, cancel := context.WithTimeout(ctx, task.Timeout())
 
-		err := task.Execute(execCtx)
+		// Bug 5: 添加 panic 恢复，使 panic 转为错误计入 FailedCount 和重试
+		err := func() (e error) {
+			defer func() {
+				if r := recover(); r != nil {
+					e = fmt.Errorf("task panicked: %v", r)
+				}
+			}()
+			return task.Execute(execCtx)
+		}()
 		cancel() // 立即释放资源，避免在循环中泄漏
 
 		if err == nil {
@@ -107,11 +117,8 @@ func (e *TaskExecutor) Execute(ctx context.Context, task Task) error {
 }
 
 // calculateBackoff 计算退避时间
+// attempt 始终 > 0（调用方在 attempt > 0 时才调用）
 func (e *TaskExecutor) calculateBackoff(attempt int, policy RetryPolicy) time.Duration {
-	if attempt <= 0 {
-		return policy.InitialInterval
-	}
-
 	interval := policy.InitialInterval
 	for i := 1; i < attempt; i++ {
 		interval = time.Duration(float64(interval) * policy.Multiplier)
@@ -123,15 +130,15 @@ func (e *TaskExecutor) calculateBackoff(attempt int, policy RetryPolicy) time.Du
 }
 
 // isRetryableError 判断错误是否可重试
-// 可以根据具体需求扩展此方法
-// 例如：网络错误、临时性错误等可以重试
-// 业务逻辑错误、验证错误等不应重试
+// context.Canceled 和 context.DeadlineExceeded 不可恢复，不应重试
 func (e *TaskExecutor) isRetryableError(err error) bool {
 	if err == nil {
 		return false
 	}
 
-	// 默认情况下，所有错误都可以重试
-	// 可以根据实际需求进行定制
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
 	return true
 }

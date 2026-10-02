@@ -130,8 +130,11 @@ func (m *SchedulerManager) Start(ctx context.Context) error {
 		}
 
 		if task.Schedule().RunOnStart {
-			m.wg.Add(1)
-			go m.runTask(ctx, task)
+			// 同步认领后再起 goroutine（见 beginRun 注释：判定必须与触发同序）
+			if m.beginRun(task) {
+				m.wg.Add(1)
+				go m.runTask(ctx, task)
+			}
 		}
 	}
 
@@ -149,6 +152,13 @@ func (m *SchedulerManager) scheduleTask(ctx context.Context, task Task) error {
 	schedule := task.Schedule()
 
 	jobFunc := func() {
+		// 同步认领：cron 触发同样必须"运行中即跳过"，不能把判定留给异步执行体
+		if !m.beginRun(task) {
+			m.logger.Warn("task is already running, skipping",
+				zap.String("task", task.Name()),
+			)
+			return
+		}
 		m.wg.Add(1)
 		m.runTask(ctx, task)
 	}
@@ -165,14 +175,26 @@ func (m *SchedulerManager) scheduleTask(ctx context.Context, task Task) error {
 	}
 }
 
-// runTask 运行任务
-func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
-	defer m.wg.Done()
-
-	// Bug 3: 检查调度器是否已停止
+// beginRun 原子地"认领"一次任务执行。
+//
+// 返回 false 表示本次触发应被**完整跳过**：调度器已停止，或在 RequireLock 下任务已在运行。
+// 返回 true 时 IsRunning 已被置为 true（调用方随后必须调用 runTask 执行并在结束时释放）。
+//
+// ⚠️ 为什么必须在**调用点同步**认领（2026-09-28 修复，由新接入的嵌套 module 测试门禁暴露）：
+// 此前"是否已在运行"的判断写在 runTask 内部，而 TriggerTask 的实现是 `go m.runTask(...)`
+// 后立即返回——于是"运行中触发即跳过"这条约定**从来没有被保证**：只要两个被触发的
+// goroutine 之间存在调度间隔（前一个在第二个拿到 CPU 之前就已结束），第二个就会看到
+// IsRunning=false 并**真的再执行一次**。实测在 `-count=N` 高重复下约 10% 触发，
+// 且失败现场明确显示 `success=2 execCount=2`（任务执行了两次）。
+// 认领移到调用点后，判定与触发同序，该约定成为**确定性**行为。
+//
+// 注意：这是模块级行为修正，不是测试放宽——原测试断言（触发两次只执行一次）是对的，
+// 是实现的保证缺失。
+func (m *SchedulerManager) beginRun(task Task) bool {
+	// 调度器已停止：不再认领任何新运行
 	select {
 	case <-m.stopCh:
-		return
+		return false
 	default:
 	}
 
@@ -180,15 +202,21 @@ func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
 
 	// Bug 1: 使用独立的状态锁保护 TaskStatus 字段的读写（不与 map 锁混用以避免死锁）
 	status.mu.Lock()
+	defer status.mu.Unlock()
 	if status.IsRunning && task.RequireLock() {
-		status.mu.Unlock()
-		m.logger.Warn("task is already running, skipping",
-			zap.String("task", task.Name()),
-		)
-		return
+		return false
 	}
 	status.IsRunning = true
-	status.mu.Unlock()
+	return true
+}
+
+// runTask 执行一次**已由 beginRun 认领**的任务运行。
+//
+// 前提：调用方已调用 beginRun 并得到 true；本方法只负责执行与在结束时清除 IsRunning。
+func (m *SchedulerManager) runTask(ctx context.Context, task Task) {
+	defer m.wg.Done()
+
+	status := m.taskStatus[task.Name()]
 
 	defer func() {
 		status.mu.Lock()
@@ -269,6 +297,16 @@ func (m *SchedulerManager) TriggerTask(ctx context.Context, taskName string) err
 
 	if !exists {
 		return fmt.Errorf("%w: %s", ErrTaskNotFound, taskName)
+	}
+
+	// 同步认领：保证"运行中触发即跳过"是确定性行为（见 beginRun 注释）。
+	// 被跳过时返回 nil —— 与既有约定一致（调用方无法区分"已触发"与"因在运行而跳过"，
+	// 二者都不是错误）。跳过原因记入日志。
+	if !m.beginRun(task) {
+		m.logger.Warn("task is already running, skipping",
+			zap.String("task", taskName),
+		)
+		return nil
 	}
 
 	m.wg.Add(1)

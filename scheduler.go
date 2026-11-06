@@ -68,8 +68,13 @@ func NewSchedulerManager(
 	}
 
 	return &SchedulerManager{
-		config:     config,
-		cron:       cron.New(cron.WithSeconds(), cron.WithLogger(cronLogger{logger: logger})),
+		config: config,
+		// cronParser 同时接受 5 段与 6 段表达式。
+		//
+		// 历史行为：固定 cron.WithSeconds() 只认 6 段，导致调用方（如 vpn-backend
+		// 的 37 个任务与既有 5 段配置）必须自行补 "0 " 前缀。SecondOptional 让
+		// 5 段表达式的秒位缺省为 0；6 段行为完全不变；Descriptor（@hourly 等）保持兼容。
+		cron:       cron.New(cron.WithParser(cronParser()), cron.WithLogger(cronLogger{logger: logger})),
 		lock:       lock,
 		executor:   NewTaskExecutor(lock, metrics, logger),
 		metrics:    metrics,
@@ -78,6 +83,14 @@ func NewSchedulerManager(
 		taskStatus: make(map[string]*TaskStatus),
 		stopCh:     make(chan struct{}),
 	}
+}
+
+// cronParser 返回同时支持 5 段与 6 段 cron 的解析器。
+func cronParser() cron.Parser {
+	return cron.NewParser(
+		cron.SecondOptional | cron.Minute | cron.Hour |
+			cron.Dom | cron.Month | cron.Dow | cron.Descriptor,
+	)
 }
 
 // RegisterTask 注册任务

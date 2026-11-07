@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"context"
+
+	dkport "github.com/HyperSpectrum-Ltd/go-domainkit/port"
 	"time"
 )
 
@@ -48,6 +50,17 @@ type RetryPolicy struct {
 	InitialInterval time.Duration
 	MaxInterval     time.Duration
 	Multiplier      float64
+}
+
+// BackoffPolicy 把调度器的重试策略映射为 domainkit 统一退避策略。
+// MaxRetries 是"首次之外的重试次数"，因此 MaxAttempts = MaxRetries + 1。
+func (p RetryPolicy) BackoffPolicy() dkport.BackoffPolicy {
+	return dkport.BackoffPolicy{
+		MaxAttempts:  p.MaxRetries + 1,
+		InitialDelay: p.InitialInterval,
+		MaxDelay:     p.MaxInterval,
+		Multiplier:   p.Multiplier,
+	}
 }
 
 // DefaultRetryPolicy 返回默认重试策略

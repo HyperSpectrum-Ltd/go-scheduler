@@ -116,17 +116,10 @@ func (e *TaskExecutor) Execute(ctx context.Context, task Task) error {
 	return lastErr
 }
 
-// calculateBackoff 计算退避时间
-// attempt 始终 > 0（调用方在 attempt > 0 时才调用）
+// calculateBackoff 计算退避时间：委托 domainkit 统一策略，
+// attempt 是 1-based 重试序号（调用方在 attempt > 0 时才调用）。
 func (e *TaskExecutor) calculateBackoff(attempt int, policy RetryPolicy) time.Duration {
-	interval := policy.InitialInterval
-	for i := 1; i < attempt; i++ {
-		interval = time.Duration(float64(interval) * policy.Multiplier)
-		if interval > policy.MaxInterval {
-			return policy.MaxInterval
-		}
-	}
-	return interval
+	return policy.BackoffPolicy().Delay(attempt)
 }
 
 // isRetryableError 判断错误是否可重试
